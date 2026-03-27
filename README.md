@@ -1,6 +1,6 @@
 # GCommander
 
-<img width="400" height="400" alt="gcommander" src="https://github.com/user-attachments/assets/f97bd1bc-9124-4f66-ae42-b6f1431323cf" />
+<img width="200" height="200" alt="gcommander" src="https://github.com/user-attachments/assets/f97bd1bc-9124-4f66-ae42-b6f1431323cf" />
 
 **High-Level Vulkan Compute API for Java**
 
