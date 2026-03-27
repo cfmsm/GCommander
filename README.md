@@ -1,7 +1,10 @@
 # GCommander
+
+<img width="400" height="400" alt="gcommander" src="https://github.com/user-attachments/assets/f97bd1bc-9124-4f66-ae42-b6f1431323cf" />
+
 **High-Level Vulkan Compute API for Java**
 
-GCommander simplifies GPU compute in Java by wrapping Vulkan boilerplate. It enables high-performance GPU computations with minimal setup, providing automatic buffer management, shader compilation, and threaded execution.
+GCommander (GPU Commander) simplifies GPU compute in Java by wrapping Vulkan boilerplate. It enables high-performance GPU computations with minimal setup, providing automatic buffer management, shader compilation, and threaded execution.
 
 ---
 
