@@ -25,7 +25,7 @@ GCommander (GPU Commander) simplifies GPU compute in Java by wrapping Vulkan boi
 
 ### Requirements
 
-* Java 17+
+* Java 21+
 * LWJGL 3 with Vulkan & Shaderc bindings
 * Vulkan drivers for your platform
 
