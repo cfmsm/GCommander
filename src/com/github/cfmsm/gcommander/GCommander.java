@@ -1,64 +1,116 @@
 package com.github.cfmsm.gcommander;
 
+import static com.github.cfmsm.gcommander.GCommand.*;
+
+import com.esotericsoftware.kryo.kryo5.*;
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.*;
+import org.lwjgl.util.vma.*;
 import org.lwjgl.vulkan.*;
 import oshi.*;
-import oshi.hardware.*;
+import com.esotericsoftware.kryo.kryo5.io.*;
+import java.io.*;
 import java.nio.*;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
-
-import static com.github.cfmsm.gcommander.GCommand.pipelineCache;
+import java.nio.file.*;
+import static org.lwjgl.util.vma.Vma.*;
 import static org.lwjgl.vulkan.VK13.*;
 
 public class GCommander {
   protected final VulkanContext vulkanContext;
   protected ComputeSession computeSession;
+  public static boolean quitOnFatalError = true;
   public static final SystemInfo si = new SystemInfo();
   protected long descriptorPool;
-  public static final HardwareAbstractionLayer hal = si.getHardware();
-  public static final List<GraphicsCard> cards = hal.getGraphicsCards();
-  public static final String vendor = cards.getFirst().getVendor().toLowerCase();
-  public final boolean hasVRAM = new SystemInfo().getHardware().getGraphicsCards().getFirst().getVRam() != 0;
-  public final boolean useStageMapping = hasVRAM || vendor.contains("apple");
+  public static final boolean hasVRAM = si.getHardware().getGraphicsCards().getFirst().getVRam() != 0;
+  public boolean useStageMapping = hasVRAM;
   public static final Map<String, byte[]> shaderCache = new ConcurrentHashMap<>();
   public static final int FRAME_LATENCY = 2;
-  public int gCommanders;
+  public static final ExecutorService virtualThreadExecutor = Executors.newVirtualThreadPerTaskExecutor();
+  private volatile boolean initialized = false;
+  protected CompletableFuture<Void> initializationFuture;
   public GCommander() {
-    this.vulkanContext = new VulkanContext();
+    vulkanContext = new VulkanContext();
   }
-  public void initialize(int sets, int gCommanders) {
-    if (System.getProperty("os.name").toLowerCase().contains("mac")) gCommanders=0; //MoltenVK is NOT thread safe
+
+  public void initialize(int sets) {
+    initializationFuture = CompletableFuture.runAsync(()->{
     try (MemoryStack stack = MemoryStack.stackPush()) {
-      this.gCommanders=gCommanders;
       vulkanContext.initialize();
       this.computeSession = new ComputeSession(vulkanContext);
       createDescriptorPool(stack, sets);
-      System.out.println("[GCommand] ✓ Vulkan initialized");
-    }
+      this.initialized = true;
+      }
+    }, virtualThreadExecutor);
   }
-  public void initialize(int sets) {
-    initialize(sets, 0);
+  public CompletableFuture<Void> initializeAsync(int sets) {
+    return CompletableFuture.runAsync(()->initialize(sets));
   }
   public void cleanup() {
-    computeSession.cleanup();
-    vulkanContext.cleanup();
-
-    for (GCommand.PipelineBundle bundle : pipelineCache.values()) {
-      vkDestroyPipeline(vulkanContext.device, bundle.pipeline, null);
-      vkDestroyPipelineLayout(vulkanContext.device, bundle.pipelineLayout, null);
-      vkDestroyDescriptorSetLayout(vulkanContext.device, bundle.descriptorSetLayout, null);
-    }
-    pipelineCache.clear();
+    initialized = false;
+    Thread.startVirtualThread(()-> {
+              computeSession.cleanup();
+              vulkanContext.cleanup();
+              for (GCommand.PipelineBundle bundle : pipelineCacheMap.values()) {
+                vkDestroyPipeline(vulkanContext.device, bundle.pipeline, null);
+                vkDestroyPipelineLayout(vulkanContext.device, bundle.pipelineLayout, null);
+                vkDestroyDescriptorSetLayout(vulkanContext.device, bundle.descriptorSetLayout, null);
+              }
+              pipelineCacheMap.clear();
+              virtualThreadExecutor.shutdown();
+            });
   }
 
-  protected static class VulkanContext implements AutoCloseable {
+  public GExecution execute(GCommand shader, GBuffer inputBuffer, GBuffer outputBuffer,
+                            int groupCountX, int groupCountY, int groupCountZ) {
+    GBuffer[] inputs = (inputBuffer == null)
+            ? new GBuffer[]{new GBuffer(outputBuffer.gCommander, 1)}
+            : new GBuffer[]{inputBuffer};
+    GBuffer[] outputs = new GBuffer[]{outputBuffer};
+    return execute(new GCommand[]{shader},
+            new GBuffer[][]{inputs},
+            new GBuffer[][]{outputs},
+            new int[]{groupCountX},
+            new int[]{groupCountY},
+            new int[]{groupCountZ});
+  }
+
+  /**
+   * Execute shaders asynchronously with deferred descriptor updates.
+   */
+  public CompletableFuture<GExecution> executeAsync(GCommand shader, GBuffer inputBuffer, GBuffer outputBuffer,
+                                                    int groupCountX, int groupCountY, int groupCountZ) {
+    return CompletableFuture.supplyAsync(() ->
+            execute(shader, inputBuffer, outputBuffer, groupCountX, groupCountY, groupCountZ)
+    );
+  }
+
+  private GExecution execute(GCommand[] shaders, GBuffer[][] inputBuffers, GBuffer[][] outputBuffers,
+                             int[] groupCountX, int[] groupCountY, int[] groupCountZ) {
+    if (inputBuffers == null) {
+      inputBuffers = new GBuffer[][]{new GBuffer[]{new GBuffer(outputBuffers[0][0].gCommander, 1)}};
+    }
+    GBuffer[][] finalInputs = inputBuffers;
+    return new GExecution() {
+      @Override
+      public void cleanup() {}
+    }.init(vulkanContext.device, () -> {
+      computeSession.execute(shaders, finalInputs, outputBuffers, groupCountX, groupCountY, groupCountZ);
+      return computeSession.getFence();
+    });
+  }
+
+    public boolean isInitialized() {
+        return initialized;
+    }
+
+    protected static class VulkanContext implements AutoCloseable {
     private VkInstance instance;
     protected VkPhysicalDevice physicalDevice;
     protected VkDevice device;
     protected long computeQueue;
+    protected long allocator;
     private int computeQueueFamily;
     private VkPhysicalDeviceProperties deviceProperties;
     private VkPhysicalDeviceMemoryProperties memoryProperties;
@@ -67,29 +119,28 @@ public class GCommander {
       try (MemoryStack stack = MemoryStack.stackPush()) {
         createInstance(stack);
         selectPhysicalDevice(stack);
-        cacheDeviceProperties();
         createLogicalDevice(stack);
+        cacheDeviceProperties();
+        createAllocator(stack);
       }
     }
 
-    private void createInstance(MemoryStack stack) {
-      VkApplicationInfo appInfo = VkApplicationInfo.calloc(stack)
-              .sType$Default()
-              .pApplicationName(stack.UTF8("Vulkan GPGPU"))
-              .applicationVersion(VK_MAKE_VERSION(1, 0, 0))
-              .apiVersion(VK_MAKE_VERSION(1, 3, 0));
-
-      VkInstanceCreateInfo createInfo = VkInstanceCreateInfo.calloc(stack)
-              .sType$Default()
-              .pApplicationInfo(appInfo);
-
-      PointerBuffer pInstance = stack.mallocPointer(1);
-      int err = vkCreateInstance(createInfo, null, pInstance);
-      if (err != VK_SUCCESS) {
-        throw new RuntimeException("Failed to create Vulkan instance: " + err);
+      private void createInstance(MemoryStack stack) {
+          VkApplicationInfo appInfo = VkApplicationInfo.calloc(stack)
+                  .sType$Default()
+                  .pApplicationName(stack.UTF8("GCommand GPGPU"))
+                  .applicationVersion(VK_MAKE_VERSION(1, 0, 0))
+                  .apiVersion(VK_MAKE_VERSION(1, 3, 0));
+          VkInstanceCreateInfo createInfo = VkInstanceCreateInfo.calloc(stack)
+                  .sType$Default()
+                  .pApplicationInfo(appInfo);
+          PointerBuffer pInstance = stack.mallocPointer(1);
+          int err = vkCreateInstance(createInfo, null, pInstance);
+          if (err != VK_SUCCESS) {
+            throw new RuntimeException("Failed to create Vulkan instance: " + err);
+          }
+          instance = new VkInstance(pInstance.get(0), createInfo);
       }
-      instance = new VkInstance(pInstance.get(0), createInfo);
-    }
 
     private void selectPhysicalDevice(MemoryStack stack) {
       IntBuffer deviceCount = stack.mallocInt(1);
@@ -97,18 +148,15 @@ public class GCommander {
       if (deviceCount.get(0) == 0) {
         throw new RuntimeException("No GPU devices found!");
       }
-
       PointerBuffer devices = stack.mallocPointer(deviceCount.get(0));
       vkEnumeratePhysicalDevices(instance, deviceCount, devices);
       physicalDevice = new VkPhysicalDevice(devices.get(0), instance);
-
       findComputeQueueFamily(stack);
     }
 
     private void cacheDeviceProperties() {
       deviceProperties = VkPhysicalDeviceProperties.malloc();
       vkGetPhysicalDeviceProperties(physicalDevice, deviceProperties);
-
       memoryProperties = VkPhysicalDeviceMemoryProperties.malloc();
       vkGetPhysicalDeviceMemoryProperties(physicalDevice, memoryProperties);
     }
@@ -116,10 +164,8 @@ public class GCommander {
     private void findComputeQueueFamily(MemoryStack stack) {
       IntBuffer queueFamilyCount = stack.mallocInt(1);
       vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, queueFamilyCount, null);
-
       VkQueueFamilyProperties.Buffer queueFamilies = VkQueueFamilyProperties.malloc(queueFamilyCount.get(0));
       vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, queueFamilyCount, queueFamilies);
-
       computeQueueFamily = -1;
       for (int i = 0; i < queueFamilies.capacity(); i++) {
         if ((queueFamilies.get(i).queueFlags() & VK_QUEUE_COMPUTE_BIT) != 0) {
@@ -128,7 +174,6 @@ public class GCommander {
         }
       }
       queueFamilies.free();
-
       if (computeQueueFamily == -1) {
         throw new RuntimeException("No compute queue family found!");
       }
@@ -140,22 +185,36 @@ public class GCommander {
               .sType$Default()
               .queueFamilyIndex(computeQueueFamily)
               .pQueuePriorities(stack.floats(1.0f));
-
       VkDeviceCreateInfo deviceCreateInfo = VkDeviceCreateInfo.calloc(stack);
       deviceCreateInfo.sType$Default()
               .pQueueCreateInfos(queueCreateInfos)
               .queueCreateInfoCount();
-
       PointerBuffer pDevice = stack.mallocPointer(1);
       int err = vkCreateDevice(physicalDevice, deviceCreateInfo, null, pDevice);
       if (err != VK_SUCCESS) {
         throw new RuntimeException("Failed to create logical device: " + err);
       }
       device = new VkDevice(pDevice.get(0), physicalDevice, deviceCreateInfo);
-
       PointerBuffer pQueue = stack.mallocPointer(1);
       vkGetDeviceQueue(device, computeQueueFamily, 0, pQueue);
       computeQueue = pQueue.get(0);
+    }
+
+    private void createAllocator(MemoryStack stack) {
+      VmaVulkanFunctions functions = VmaVulkanFunctions.calloc(stack)
+              .set(instance, device);
+      VmaAllocatorCreateInfo allocatorInfo = VmaAllocatorCreateInfo.calloc(stack)
+              .pVulkanFunctions(functions)
+              .instance(instance)
+              .physicalDevice(physicalDevice)
+              .device(device)
+              .vulkanApiVersion(VK_API_VERSION_1_3);
+      PointerBuffer pAllocator = stack.mallocPointer(1);
+      int err = vmaCreateAllocator(allocatorInfo, pAllocator);
+      if (err != VK_SUCCESS) {
+        throw new RuntimeException("Failed to create VMA allocator: " + err);
+      }
+      allocator = pAllocator.get(0);
     }
 
     public int getComputeQueueFamily() {
@@ -172,6 +231,9 @@ public class GCommander {
 
     @Override
     public void close() {
+      if (allocator != 0) {
+        vmaDestroyAllocator(allocator);
+      }
       if (device != null) {
         vkDeviceWaitIdle(device);
         vkDestroyDevice(device, null);
@@ -187,46 +249,21 @@ public class GCommander {
       close();
     }
   }
-
-  public void execute(GCommand shader, GBuffer[] inputBuffers, GBuffer[] outputBuffers,
-                      int groupCountX, int groupCountY, int groupCountZ) {
-    computeSession.execute(shader, inputBuffers, outputBuffers, groupCountX, groupCountY, groupCountZ);
-  }
-
-  public void execute(GCommand shader, GBuffer inputBuffer, GBuffer outputBuffer,
-                      int groupCountX, int groupCountY, int groupCountZ) {
-    computeSession.execute(shader, new GBuffer[]{inputBuffer}, new GBuffer[]{outputBuffer}, groupCountX, groupCountY, groupCountZ);
-  }
-  public void execute(GCommand[] shaders,
-                      GBuffer[][] inputBuffers,
-                      GBuffer[][] outputBuffers,
-                      int[] groupCountX,
-                      int[] groupCountY,
-                      int[] groupCountZ) {
-      computeSession.execute(shaders, inputBuffers, outputBuffers, groupCountX, groupCountY, groupCountZ);
-  }
-  public void execute(GCommand[] shaders, GBuffer[] inputBuffers, GBuffer[] outputBuffers, int[] groupCountX, int[] groupCountY, int[] groupCountZ) {
-    execute(shaders, new GBuffer[][]{inputBuffers}, new GBuffer[][]{outputBuffers}, groupCountX, groupCountY, groupCountZ);
-  }
-  public void execute(GCommand[] shaders, GBuffer inputBuffer, GBuffer outputBuffer, int[] groupCountX, int[] groupCountY, int[] groupCountZ) {
-    execute(shaders, new GBuffer[]{inputBuffer}, new GBuffer[]{outputBuffer}, groupCountX, groupCountY, groupCountZ);
-  }
-  protected class ComputeSession implements AutoCloseable {
+  protected static class ComputeSession implements AutoCloseable {
     private final VulkanContext vulkanContext;
     protected long commandPool;
     private final long[] fences;
     private final long[] commandBuffers;
     private int frameIndex = 0;
-    private final AtomicInteger numThreads = new AtomicInteger(0);
+    private final Object frameIndexLock = new Object();
     ComputeSession(VulkanContext vulkanContext) {
       this.vulkanContext = vulkanContext;
       this.fences = new long[FRAME_LATENCY];
       this.commandBuffers = new long[FRAME_LATENCY];
-
       try (MemoryStack stack = MemoryStack.stackPush()) {
+        createFences(stack);
         createCommandPool(stack);
         allocateCommandBuffers(stack);
-        createFences(stack);
       }
     }
 
@@ -235,7 +272,6 @@ public class GCommander {
               .sType$Default()
               .queueFamilyIndex(vulkanContext.getComputeQueueFamily())
               .flags(VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT);
-
       LongBuffer pCommandPool = stack.mallocLong(1);
       int err = vkCreateCommandPool(vulkanContext.device, poolInfo, null, pCommandPool);
       if (err != VK_SUCCESS) {
@@ -243,63 +279,61 @@ public class GCommander {
       }
       commandPool = pCommandPool.get(0);
     }
-    public void execute(GCommand[] shaders,
-                        GBuffer[][] inputs,
-                        GBuffer[][] outputs,
+
+    public void execute(GCommand[] shaders, GBuffer[][] inputs, GBuffer[][] outputs,
                         int[] gx, int[] gy, int[] gz) {
-      Runnable r = ()-> {
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-          long fence = fences[frameIndex];
-          long cmd = commandBuffers[frameIndex];
-          vkResetFences(vulkanContext.device, stack.longs(fence));
-
-          VkCommandBuffer vkCmd = new VkCommandBuffer(cmd, vulkanContext.device);
-          vkResetCommandBuffer(vkCmd, VK_COMMAND_BUFFER_LEVEL_PRIMARY);
-
-          VkCommandBufferBeginInfo begin = VkCommandBufferBeginInfo.calloc(stack)
-                  .sType$Default()
-                  .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
-
-          vkBeginCommandBuffer(vkCmd, begin);
-
-          for (int i = 0; i < shaders.length; i++) {
-            GCommand shader = shaders[i];
-
-            shader.updateDescriptorSet(
-                    vulkanContext.device,
-                    inputs[i],
-                    outputs[i],
-                    stack
-            );
-
-            vkCmdBindPipeline(vkCmd, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipeline);
-
-            vkCmdBindDescriptorSets(
-                    vkCmd,
-                    VK_PIPELINE_BIND_POINT_COMPUTE,
-                    shader.pipelineLayout,
-                    0,
-                    stack.longs(shader.descriptorSet),
-                    null
-            );
-
-            vkCmdDispatch(vkCmd, gx[i], gy[i], gz[i]);
-          }
-
-          vkEndCommandBuffer(vkCmd);
-
-          VkSubmitInfo submit = VkSubmitInfo.calloc(stack)
-                  .sType$Default()
-                  .pCommandBuffers(stack.pointers(cmd));
-          vkQueueSubmit(new VkQueue(vulkanContext.computeQueue, vulkanContext.device), submit, fence);
-
+      if (inputs == null) inputs = new GBuffer[][]{new GBuffer[]{new GBuffer(outputs[0][0].gCommander, 1)}};
+      GBuffer[][] finalInputs = inputs;
+      executeInternal(shaders, finalInputs, outputs, gx, gy, gz);
+    }
+    private void executeInternal(GCommand[] shaders, GBuffer[][] inputs, GBuffer[][] outputs,
+                                 int[] gx, int[] gy, int[] gz) {
+      try (MemoryStack stack = MemoryStack.stackPush()) {
+        int currentFrameIndex;
+        long fence;
+        long cmd;
+        synchronized (frameIndexLock) {
+          currentFrameIndex = frameIndex;
           frameIndex = (frameIndex + 1) % FRAME_LATENCY;
+          fence = fences[currentFrameIndex];
+          cmd = commandBuffers[currentFrameIndex];
         }
-      };
-      if (numThreads.get() < gCommanders) Thread.startVirtualThread(() -> {
-        numThreads.incrementAndGet();
-        try { r.run(); } finally { numThreads.decrementAndGet(); }
-      });
+        vkWaitForFences(vulkanContext.device, stack.longs(fence), true, Long.MAX_VALUE);
+        vkResetFences(vulkanContext.device, stack.longs(fence));
+        VkCommandBuffer vkCmd = new VkCommandBuffer(cmd, vulkanContext.device);
+        vkResetCommandBuffer(vkCmd, VK_COMMAND_BUFFER_LEVEL_PRIMARY);
+        VkCommandBufferBeginInfo begin = VkCommandBufferBeginInfo.calloc(stack)
+                .sType$Default()
+                .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+        vkBeginCommandBuffer(vkCmd, begin);
+
+        // Record all shader dispatches
+        for (int i = 0; i < shaders.length; i++) {
+          shaders[i].future.join();
+          recordShaderDispatch(vkCmd, shaders[i], inputs[i], outputs[i], gx[i], gy[i], gz[i], stack);
+        }
+        vkEndCommandBuffer(vkCmd);
+        VkSubmitInfo submit = VkSubmitInfo.calloc(stack)
+                .sType$Default()
+                .pCommandBuffers(stack.pointers(cmd));
+        vkQueueSubmit(new VkQueue(vulkanContext.computeQueue, vulkanContext.device), submit, fence);
+      }
+    }
+
+    private void recordShaderDispatch(VkCommandBuffer vkCmd, GCommand shader,
+                                      GBuffer[] inputs, GBuffer[] outputs,
+                                      int gx, int gy, int gz, MemoryStack stack) {
+      shader.updateDescriptorSet(vulkanContext.device, inputs, outputs, stack);
+      vkCmdBindPipeline(vkCmd, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipeline);
+      vkCmdBindDescriptorSets(vkCmd, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipelineLayout,
+              0, stack.longs(shader.descriptorSet), null);
+      vkCmdDispatch(vkCmd, gx, gy, gz);
+      VkMemoryBarrier.Buffer barrier = VkMemoryBarrier.calloc(1, stack)
+              .sType$Default()
+              .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT)
+              .dstAccessMask(VK_ACCESS_SHADER_READ_BIT);
+      vkCmdPipelineBarrier(vkCmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, barrier, null, null);
     }
     private void allocateCommandBuffers(MemoryStack stack) {
       VkCommandBufferAllocateInfo allocInfo = VkCommandBufferAllocateInfo.calloc(stack)
@@ -307,7 +341,6 @@ public class GCommander {
               .commandPool(commandPool)
               .level(VK_COMMAND_BUFFER_LEVEL_PRIMARY)
               .commandBufferCount(FRAME_LATENCY);
-
       PointerBuffer pCommandBuffers = stack.mallocPointer(FRAME_LATENCY);
       int err = vkAllocateCommandBuffers(vulkanContext.device, allocInfo, pCommandBuffers);
       if (err != VK_SUCCESS) {
@@ -320,7 +353,9 @@ public class GCommander {
 
     private void createFences(MemoryStack stack) {
       for (int i = 0; i < FRAME_LATENCY; i++) {
-        VkFenceCreateInfo fenceInfo = VkFenceCreateInfo.calloc(stack).sType$Default().flags(VK_FENCE_CREATE_SIGNALED_BIT);
+        VkFenceCreateInfo fenceInfo = VkFenceCreateInfo.calloc(stack)
+                .sType$Default()
+                .flags(VK_FENCE_CREATE_SIGNALED_BIT);
         LongBuffer pFence = stack.mallocLong(1);
         int err = vkCreateFence(vulkanContext.device, fenceInfo, null, pFence);
         if (err != VK_SUCCESS) {
@@ -329,66 +364,17 @@ public class GCommander {
         fences[i] = pFence.get(0);
       }
     }
-    public void execute(GCommand shader, GBuffer[] inputBuffers, GBuffer[] outputBuffers,
-                        int groupCountX, int groupCountY, int groupCountZ) {
-      Runnable r = ()-> {
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-          long currentFence = fences[frameIndex];
-          long currentCmdBuf = commandBuffers[frameIndex];
-          vkResetFences(vulkanContext.device, stack.longs(currentFence));
-
-          shader.updateDescriptorSet(vulkanContext.device, inputBuffers, outputBuffers, stack);
-          executeComputeShader(shader, currentCmdBuf, groupCountX, groupCountY, groupCountZ, currentFence, stack);
-          frameIndex = (frameIndex + 1) % FRAME_LATENCY;
-        }
-      };
-      if (numThreads.get() < gCommanders) Thread.startVirtualThread(() -> {
-        numThreads.incrementAndGet();
-        try { r.run(); } finally { numThreads.decrementAndGet(); }
-      });
-    }
-
-    private void executeComputeShader(GCommand shader, long commandBuffer, int groupCountX, int groupCountY,
-                                      int groupCountZ, long fence, MemoryStack stack) {
-      VkCommandBuffer vkCmdBuf = new VkCommandBuffer(commandBuffer, vulkanContext.device);
-      vkResetCommandBuffer(vkCmdBuf, VK_COMMAND_BUFFER_LEVEL_PRIMARY);
-
-      VkCommandBufferBeginInfo beginInfo = VkCommandBufferBeginInfo.calloc(stack)
-              .sType$Default()
-              .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
-
-      int err = vkBeginCommandBuffer(vkCmdBuf, beginInfo);
-      if (err != VK_SUCCESS) {
-        throw new RuntimeException("Failed to begin command buffer: " + err);
-      }
-
-      vkCmdBindPipeline(vkCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipeline);
-      vkCmdBindDescriptorSets(vkCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipelineLayout,
-              0, stack.longs(shader.descriptorSet), null);
-
-      vkCmdDispatch(vkCmdBuf, groupCountX, groupCountY, groupCountZ);
-
-      err = vkEndCommandBuffer(vkCmdBuf);
-      if (err != VK_SUCCESS) {
-        throw new RuntimeException("Failed to end command buffer: " + err);
-      }
-
-      VkSubmitInfo submitInfo = VkSubmitInfo.calloc(stack)
-              .sType$Default()
-              .pCommandBuffers(stack.pointers(commandBuffer));
-
-      err = vkQueueSubmit(new VkQueue(vulkanContext.computeQueue, vulkanContext.device), submitInfo, fence);
-      if (err != VK_SUCCESS) {
-        throw new RuntimeException("Failed to submit compute queue: " + err);
-      }
-    }
 
     public long getFence() {
-      return fences[frameIndex];
+      synchronized (frameIndexLock) {
+        return fences[frameIndex];
+      }
     }
 
     public long getCommandBuffer() {
-      return commandBuffers[frameIndex];
+      synchronized (frameIndexLock) {
+        return commandBuffers[frameIndex];
+      }
     }
 
     @Override
@@ -405,19 +391,13 @@ public class GCommander {
     void cleanup() {
       close();
     }
-    private void increment() {
-      numThreads.incrementAndGet();
-    }
-    private void decrement() {
-      numThreads.decrementAndGet();
-    }
-  } public void createDescriptorPool(MemoryStack stack, int sets) {
+  }
+
+  private void createDescriptorPool(MemoryStack stack, int sets) {
     VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(1, stack);
     poolSizes.get(0).type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(2);
-
     VkDescriptorPoolCreateInfo poolInfo = VkDescriptorPoolCreateInfo.calloc(stack)
             .sType$Default().pPoolSizes(poolSizes).maxSets(sets);
-
     LongBuffer pPool = stack.mallocLong(1);
     int err = vkCreateDescriptorPool(vulkanContext.device, poolInfo, null, pPool);
     if (err != VK_SUCCESS) {
