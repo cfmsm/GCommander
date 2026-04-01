@@ -83,7 +83,7 @@ FloatBuffer results = output.readFloat();
 
 ---
 ## Full Example (with Async)
-```
+```java
 import java.nio.*;
 import java.util.Arrays;
 import java.util.concurrent.*;
