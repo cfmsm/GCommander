@@ -82,7 +82,54 @@ FloatBuffer results = output.readFloat();
 ```
 
 ---
+## Full Example (with Async)
+```
+import java.nio.*;
+import java.util.Arrays;
+import java.util.concurrent.*;
+public class GCommanderExample {
+    /**
+    Executes id+1
+     **/
+    public static void main(String[] args) {
+        GCommander gCommander = new GCommander();
+        gCommander.initialize(1024);
+        int size = (1024 * 4);
+        String src = GCommandBuilder.header(GCommandBuilder.UINT32) + """
+                layout(local_size_x=512, local_size_y=1, local_size_z=1) in;
+                void main() {
+                uint id = gl_GlobalInvocationID.x;
+                outputBuf.data[id]=id + inputBuf.data[id];
+                }
+                """;
+        try (GCommand gCommand = new GCommand(gCommander, src); GBuffer inputBuffer = GBuffer.ofFloat(gCommander, size); GBuffer outputBuf = GBuffer.ofFloat(gCommander, size)) {
+            int[] input = new int[size];
+            Arrays.fill(input, 1);
+            inputBuffer.upload(input);
+            long computeStart = System.currentTimeMillis();
+            CompletableFuture<GExecution> executionFuture = gCommander.executeAsync(gCommand, inputBuffer, outputBuf, size, 1, 1);
+            GExecution execution = executionFuture.join();
+            execution.prepareFence();
+            execution.waitIfIncomplete();
+            long computeEnd = System.currentTimeMillis();
+            long transferStart = System.currentTimeMillis();
+            IntBuffer buffer = outputBuf.readInt();
+            int[] output = new int[buffer.capacity()];
+            buffer.get(output);
+            for (int i : output) {
+                System.out.println(i);
+            }
+            System.out.println("Computed in " + (computeEnd - computeStart) + "ms");
+            System.out.println("Transferred in " + (System.currentTimeMillis() - transferStart) + "ms");
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        gCommander.cleanup();
+    }
+}
+```
 
+---
 ## Advanced Usage
 
 * **Multiple Shaders:** Run several compute shaders in a single submission.
