@@ -15,7 +15,9 @@ GCommander (GPU Commander) simplifies GPU compute in Java by wrapping Vulkan boi
 * Threaded command execution (`GCommander`)
 * Automatic descriptor, pipeline, and staging management
 * Low boilerplate for Vulkan compute operations
-* GPU-aware optimizations for Intel, AMD, NVIDIA, and Apple Silicon GPUs
+* High efficiency
+* Uses VMA for fast allocation
+* Caches pipelines persistently
 
 ---
 
@@ -73,9 +75,10 @@ GCommand shader = new GCommand(g, glsl);
 ### Execute Shader
 
 ```java
-g.execute(shader, input, output, 16, 1, 1); // group counts
-output.sync(); // Wait for GPU to finish
-float[] results = output.read();
+GExecution execution = g.execute(shader, input, output, 16, 1, 1); // group counts
+execution.prepareFence(); //important
+execution.waitIfIncomplete(); // Wait for GPU to finish
+FloatBuffer results = output.readFloat();
 ```
 
 ---
